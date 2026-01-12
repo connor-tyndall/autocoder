@@ -18,23 +18,48 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from dotenv import load_dotenv
 
 from .assistant_database import (
     add_message,
     create_conversation,
 )
 
+# Load environment variables from .env file if present
+load_dotenv()
+
+
+def get_cli_command() -> str:
+    """
+    Get the CLI command to use for the agent.
+
+    Reads from CLI_COMMAND environment variable, defaults to 'claude'.
+    This allows users to use alternative CLIs like 'glm'.
+    """
+    return os.getenv("CLI_COMMAND", "claude")
+
+
 logger = logging.getLogger(__name__)
 
 # Root directory of the project
 ROOT_DIR = Path(__file__).parent.parent.parent
 
-# Read-only feature MCP tools (no mark_passing, skip, create_bulk)
+# Read-only feature MCP tools
 READONLY_FEATURE_MCP_TOOLS = [
     "mcp__features__feature_get_stats",
     "mcp__features__feature_get_next",
     "mcp__features__feature_get_for_regression",
 ]
+
+# Feature management tools (create/skip but not mark_passing)
+FEATURE_MANAGEMENT_TOOLS = [
+    "mcp__features__feature_create",
+    "mcp__features__feature_create_bulk",
+    "mcp__features__feature_skip",
+]
+
+# Combined list for assistant
+ASSISTANT_FEATURE_TOOLS = READONLY_FEATURE_MCP_TOOLS + FEATURE_MANAGEMENT_TOOLS
 
 # Read-only built-in tools (no Write, Edit, Bash)
 READONLY_BUILTIN_TOOLS = [
@@ -60,17 +85,30 @@ def get_system_prompt(project_name: str, project_dir: Path) -> str:
         except Exception as e:
             logger.warning(f"Failed to read app_spec.txt: {e}")
 
-    return f"""You are a helpful project assistant for the "{project_name}" project.
+    return f"""You are a helpful project assistant and backlog manager for the "{project_name}" project.
 
-Your role is to help users understand the codebase, answer questions about features, and explain how code works. You have READ-ONLY access to the project files.
+Your role is to help users understand the codebase, answer questions about features, and manage the project backlog. You can READ files and CREATE/MANAGE features, but you cannot modify source code.
 
-IMPORTANT: You CANNOT modify any files. You can only:
+## What You CAN Do
+
+**Codebase Analysis (Read-Only):**
 - Read and analyze source code files
 - Search for patterns in the codebase
 - Look up documentation online
 - Check feature progress and status
 
-If the user asks you to make changes, politely explain that you're a read-only assistant and they should use the main coding agent for modifications.
+**Feature Management:**
+- Create new features/test cases in the backlog
+- Skip features to deprioritize them (move to end of queue)
+- View feature statistics and progress
+
+## What You CANNOT Do
+
+- Modify, create, or delete source code files
+- Mark features as passing (that requires actual implementation by the coding agent)
+- Run bash commands or execute code
+
+If the user asks you to modify code, explain that you're a project assistant and they should use the main coding agent for implementation.
 
 ## Project Specification
 
@@ -78,14 +116,35 @@ If the user asks you to make changes, politely explain that you're a read-only a
 
 ## Available Tools
 
-You have access to these read-only tools:
+**Code Analysis:**
 - **Read**: Read file contents
 - **Glob**: Find files by pattern (e.g., "**/*.tsx")
 - **Grep**: Search file contents with regex
 - **WebFetch/WebSearch**: Look up documentation online
+
+**Feature Management:**
 - **feature_get_stats**: Get feature completion progress
 - **feature_get_next**: See the next pending feature
-- **feature_get_for_regression**: See passing features
+- **feature_get_for_regression**: See passing features for testing
+- **feature_create**: Create a single feature in the backlog
+- **feature_create_bulk**: Create multiple features at once
+- **feature_skip**: Move a feature to the end of the queue
+
+## Creating Features
+
+When a user asks to add a feature, gather the following information:
+1. **Category**: A grouping like "Authentication", "API", "UI", "Database"
+2. **Name**: A concise, descriptive name
+3. **Description**: What the feature should do
+4. **Steps**: How to verify/implement the feature (as a list)
+
+You can ask clarifying questions if the user's request is vague, or make reasonable assumptions for simple requests.
+
+**Example interaction:**
+User: "Add a feature for S3 sync"
+You: I'll create that feature. Let me add it to the backlog...
+[calls feature_create with appropriate parameters]
+You: Done! I've added "S3 Sync Integration" to your backlog. It's now visible on the kanban board.
 
 ## Guidelines
 
@@ -93,7 +152,8 @@ You have access to these read-only tools:
 2. When explaining code, reference specific file paths and line numbers
 3. Use the feature tools to answer questions about project progress
 4. Search the codebase to find relevant information before answering
-5. If you're unsure, say so rather than guessing"""
+5. When creating features, confirm what was created
+6. If you're unsure about details, ask for clarification"""
 
 
 class AssistantChatSession:
@@ -131,12 +191,15 @@ class AssistantChatSession:
                 self._client_entered = False
                 self.client = None
 
-    async def start(self) -> AsyncGenerator[dict, None]:
+    async def start(self, skip_greeting: bool = False) -> AsyncGenerator[dict, None]:
         """
         Initialize session with the Claude client.
 
         Creates a new conversation if none exists, then sends an initial greeting.
         Yields message chunks as they stream in.
+
+        Args:
+            skip_greeting: If True, skip sending the greeting (for resuming conversations)
         """
         # Create a new conversation if we don't have one
         if self.conversation_id is None:
@@ -144,14 +207,14 @@ class AssistantChatSession:
             self.conversation_id = conv.id
             yield {"type": "conversation_created", "conversation_id": self.conversation_id}
 
-        # Build permissions list for read-only access
+        # Build permissions list for assistant access (read + feature management)
         permissions_list = [
             "Read(./**)",
             "Glob(./**)",
             "Grep(./**)",
             "WebFetch",
             "WebSearch",
-            *READONLY_FEATURE_MCP_TOOLS,
+            *ASSISTANT_FEATURE_TOOLS,
         ]
 
         # Create security settings file
@@ -182,8 +245,9 @@ class AssistantChatSession:
         # Get system prompt with project context
         system_prompt = get_system_prompt(self.project_name, self.project_dir)
 
-        # Use system Claude CLI
-        system_cli = shutil.which("claude")
+        # Use system CLI (configurable via CLI_COMMAND environment variable)
+        cli_command = get_cli_command()
+        system_cli = shutil.which(cli_command)
 
         try:
             self.client = ClaudeSDKClient(
@@ -191,7 +255,7 @@ class AssistantChatSession:
                     model="claude-opus-4-5-20251101",
                     cli_path=system_cli,
                     system_prompt=system_prompt,
-                    allowed_tools=[*READONLY_BUILTIN_TOOLS, *READONLY_FEATURE_MCP_TOOLS],
+                    allowed_tools=[*READONLY_BUILTIN_TOOLS, *ASSISTANT_FEATURE_TOOLS],
                     mcp_servers=mcp_servers,
                     permission_mode="bypassPermissions",
                     max_turns=100,
@@ -206,18 +270,19 @@ class AssistantChatSession:
             yield {"type": "error", "content": f"Failed to initialize assistant: {str(e)}"}
             return
 
-        # Send initial greeting
-        try:
-            greeting = f"Hello! I'm your project assistant for **{self.project_name}**. I can help you understand the codebase, explain features, and answer questions about the project. What would you like to know?"
+        # Send initial greeting (unless resuming)
+        if not skip_greeting:
+            try:
+                greeting = f"Hello! I'm your project assistant for **{self.project_name}**. I can help you understand the codebase, manage features (create and deprioritize), and answer questions about the project. What would you like to do?"
 
-            # Store the greeting in the database
-            add_message(self.project_dir, self.conversation_id, "assistant", greeting)
+                # Store the greeting in the database
+                add_message(self.project_dir, self.conversation_id, "assistant", greeting)
 
-            yield {"type": "text", "content": greeting}
-            yield {"type": "response_done"}
-        except Exception as e:
-            logger.exception("Failed to send greeting")
-            yield {"type": "error", "content": f"Failed to start conversation: {str(e)}"}
+                yield {"type": "text", "content": greeting}
+                yield {"type": "response_done"}
+            except Exception as e:
+                logger.exception("Failed to send greeting")
+                yield {"type": "error", "content": f"Failed to start conversation: {str(e)}"}
 
     async def send_message(self, user_message: str) -> AsyncGenerator[dict, None]:
         """
